@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Stokers GIF recorder</title>
+<style>
+  html,body{margin:0;background:#0b0805;color:#d7c8ab;font-family:"SF Mono","Menlo","Consolas",monospace;}
+  body{padding:24px;display:flex;flex-direction:column;gap:14px;align-items:flex-start;}
+  canvas{border:1px solid #2a201a;background:#0b0805;display:block;}
+  #preview{border:1px solid #2a201a;display:block;max-width:100%;}
+  .row{display:flex;gap:14px;align-items:center;flex-wrap:wrap;}
+  button,a.btn{background:#1c150f;color:#efe1c4;border:1px solid #4a382a;padding:8px 14px;font:inherit;cursor:pointer;text-decoration:none;border-radius:4px;}
+  button:hover,a.btn:hover{background:#241a13;}
+  .status{color:#c9b89a;font-size:13px;}
+  .ok{color:#7fd4ff;}
+  h2{margin:0;color:#efe1c4;font-weight:500;font-size:15px;letter-spacing:.06em;text-transform:uppercase;}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.js"></script>
+</head>
+<body>
+
+<h2>token furnace · gif recorder</h2>
+<canvas id="cv"></canvas>
+<div class="row">
+  <button id="rec">Re-record GIF</button>
+  <a id="dl" class="btn" download="stokers.gif" style="display:none">⬇ Download stokers.gif</a>
+  <span id="status" class="status">starting auto-record…</span>
+</div>
+<div style="font-size:12px;color:#7a6650;max-width:640px;">
+  Auto-records on load (~5–10s). Click <b>Download stokers.gif</b> when ready. The GIF loops infinitely — paste it into your README or upload to social media.
+</div>
+<h2 style="margin-top:8px">preview</h2>
+<img id="preview" alt="" />
+
+<script>
+/* ============================================================
+   Shared animation engine — same as stokers.html, but rendered
+   to a single <canvas> via fillText so we can record frames.
+   ============================================================ */
+
+const W = 64, H = 22;
+const CHAR_W = 9, CHAR_H = 15;
+const FONT_SIZE = 13;
+const FONT = `${FONT_SIZE}px "SF Mono","Menlo","Consolas","DejaVu Sans Mono",monospace`;
+
+const COLORS = {
+  default: '#d7c8ab',
+  frameC:  '#6b513c',
+  body:    '#efe1c4',
+  coal:    '#8a7868',
+  coalHi:  '#c4b39e',
+  label:   '#c9b89a',
+  token:   '#7fd4ff',
+  ember:   '#ff7a18',
+  flame:   '#ffb347',
+  spark:   '#ffe066',
+  smoke:   '#7d6b5a',
+  bricks:  '#4a382a',
+  dim:     '#7a6650',
+  prompt:  '#ff7a18',
+};
+const GLOW_CLASSES = new Set(['ember','flame','spark']);
+
+/* Fixed RGB palette for post-render quantization — keeps GIF tiny */
+const PALETTE = [
+  [11,8,5],       // 0  bg
+  [215,200,171],  // 1  default
+  [107,81,60],    // 2  frameC
+  [239,225,196],  // 3  body
+  [138,120,104],  // 4  coal
+  [196,179,158],  // 5  coalHi
+  [201,184,154],  // 6  label
+  [127,212,255],  // 7  token
+  [255,122,24],   // 8  ember / prompt
+  [255,179,71],   // 9  flame
+  [255,224,102],  // 10 spark
+  [125,107,90],   // 11 smoke
+  [74,56,42],     // 12 bricks
+  [122,102,80],   // 13 dim
+  [40,28,18],     // 14 mid shadow (mostly AA halos)
+];
+function snapToPalette(imageData){
+  const d = imageData.data;
+  const n = d.length;
+  const P = PALETTE;
+  const PL = P.length;
+  for (let i=0;i<n;i+=4){
+    const r = d[i], g = d[i+1], b = d[i+2];
+    let best = 0, bestDist = 1e9;
+    for (let p=0;p<PL;p++){
+      const pr = P[p][0], pg = P[p][1], pb = P[p][2];
+      const dr = r-pr, dg = g-pg, db = b-pb;
+      const dist = dr*dr + dg*dg + db*db;
+      if (dist < bestDist) { bestDist = dist; best = p; }
+    }
+    d[i]   = P[best][0];
+    d[i+1] = P[best][1];
+    d[i+2] = P[best][2];
+  }
+  return imageData;
+}
+
+const cv = document.getElementById('cv');
+cv.width = W * CHAR_W;
+cv.height = H * CHAR_H + 24;
+const ctx = cv.getContext('2d', { willReadFrequently: true });
+
+function makeGrid(){
+  const g = new Array(H);
+  for (let r=0;r<H;r++){
+    g[r] = new Array(W);
+    for (let c=0;c<W;c++) g[r][c] = {ch:' ', cls:null};
+  }
+  return g;
+}
+function put(g, r, c, ch, cls){
+  if (r<0||r>=H||c<0||c>=W) return;
+  g[r][c] = {ch, cls};
+}
+function stamp(g, r, c, block, cls){
+  const lines = block.split("\n");
+  for (let i=0;i<lines.length;i++){
+    const line = lines[i];
+    for (let j=0;j<line.length;j++){
+      const ch = line[j];
+      if (ch !== ' ') put(g, r+i, c+j, ch, cls);
+    }
+  }
+}
+
+/* ---- scene parts (mirrored from stokers.html) ---- */
+const DOOR = { r0: 10, r1: 12, c0: 28, c1: 34 };
+
+const stokerL_up = [
+  "             ",
+  "  \\____      ",
+  "       \\ O   ",
+  "        /|   ",
+  "        / \\  ",
+].join("\n");
+const stokerL_down = [
+  "             ",
+  "             ",
+  "   O_________",
+  "  /|         ",
+  "  / \\        ",
+].join("\n");
+const stokerR_up = [
+  "             ",
+  "      ____/  ",
+  "   O /       ",
+  "   |\\        ",
+  "   / \\       ",
+].join("\n");
+const stokerR_down = [
+  "             ",
+  "             ",
+  "_________O   ",
+  "         |\\  ",
+  "        / \\  ",
+].join("\n");
+
+const coalBase = [
+  "  &&%  ",
+  " &%@%& ",
+  "&%@@%&%",
+  "%@@%@@&",
+].join("\n");
+const coalHi = [
+  "  ·    ",
+  " *   · ",
+  "·   *  ",
+  "   ·   ",
+].join("\n");
+
+function buildBG(phase){
+  const g = makeGrid();
+
+  // chimney
+  stamp(g, 4, 30, " __ \n|  |\n|__|", 'frameC');
+
+  // furnace top
+  put(g, 7, 19, '┌', 'frameC');
+  for (let c=20;c<=43;c++) put(g, 7, c, '─', 'frameC');
+  put(g, 7, 44, '┐', 'frameC');
+  // side walls
+  for (let r=8; r<=14; r++){
+    put(g, r, 19, '│', 'frameC');
+    put(g, r, 44, '│', 'frameC');
+  }
+  // furnace bottom
+  put(g, 15, 19, '└', 'frameC');
+  for (let c=20;c<=43;c++) put(g, 15, c, '─', 'frameC');
+  put(g, 15, 44, '┘', 'frameC');
+
+  // door frame
+  put(g, 9, 27, '╔', 'frameC');
+  for (let c=28;c<=34;c++) put(g, 9, c, '═', 'frameC');
+  put(g, 9, 35, '╗', 'frameC');
+  for (let r=10;r<=12;r++){
+    put(g, r, 27, '║', 'frameC');
+    put(g, r, 35, '║', 'frameC');
+  }
+  put(g, 13, 27, '╚', 'frameC');
+  for (let c=28;c<=34;c++) put(g, 13, c, '═', 'frameC');
+  put(g, 13, 35, '╝', 'frameC');
+
+  // bricks base
+  const bricks = "▓██▓██▓██▓██▓██▓██▓██▓██▓█";
+  for (let i=0;i<bricks.length && 19+i<=44;i++){
+    put(g, 16, 19+i, bricks[i], 'bricks');
+  }
+  for (let c=19;c<=44;c++) put(g, 17, c, '═', 'bricks');
+
+  // coal piles
+  stamp(g, 14,  1, coalBase, 'coal');
+  stamp(g, 14, 57, coalBase, 'coal');
+  stamp(g, 14,  1, coalHi,   'coalHi');
+  stamp(g, 14, 57, coalHi,   'coalHi');
+
+  // stokers
+  const left  = (phase === 0) ? stokerL_up   : stokerL_down;
+  const right = (phase === 0) ? stokerR_down : stokerR_up;
+  stamp(g, 12,  7, left,  'body');
+  stamp(g, 12, 44, right, 'body');
+
+  // prompt line
+  const prompt = "$ ";
+  const cmd = "claude burn-tokens --aggressive";
+  const full = prompt + cmd;
+  const lc = Math.floor((W - full.length)/2);
+  for (let i=0;i<prompt.length;i++) put(g, 19, lc+i, prompt[i], 'prompt');
+  for (let i=0;i<cmd.length;i++)    put(g, 19, lc+prompt.length+i, cmd[i], 'label');
+
+  // pile tags
+  const tagL = "context";
+  const tagR = "history";
+  for (let i=0;i<tagL.length;i++) put(g, 18,  1+i, tagL[i], 'dim');
+  for (let i=0;i<tagR.length;i++) put(g, 18, 56+i, tagR[i], 'dim');
+
+  return g;
+}
+
+const FLAME_MID  = ["(","{","Ѫ","Ѧ","ѫ","ʌ","∧","Ѩ","ω","∂"];
+const FLAME_TIPS = ["'",".","`","¨","ˆ",","];
+const EMBER_GLY  = ["▓","▒","█","▓","▒","░"];
+const SMOKE_GLY  = ["·",".","°","˚","∘",",","'"];
+
+function rand(a,b){ return a + Math.random()*(b-a); }
+function pick(a){ return a[Math.floor(Math.random()*a.length)]; }
+
+function renderFlame(intensity){
+  const g = makeGrid();
+  const { r0, r1, c0, c1 } = DOOR;
+  for (let c=c0; c<=c1; c++) put(g, r1, c, pick(EMBER_GLY), 'ember');
+  for (let r=r1-1; r>=r0; r--){
+    for (let c=c0; c<=c1; c++){
+      if (Math.random() < 0.55 + intensity*0.15){
+        put(g, r, c, pick(FLAME_MID), 'flame');
+      }
+    }
+  }
+  for (let c=c0; c<=c1; c++){
+    if (Math.random() < 0.55){
+      put(g, r0, c, pick(FLAME_TIPS), 'spark');
+    }
+  }
+  return g;
+}
+
+const sparks = [], smokes = [], tokens = [];
+const WORDS = ["tok","</s>","42","≈","$$","···","</>","[EOS]","256","∞","λ","#"];
+
+function spawnSpark(x, y){
+  sparks.push({
+    x: x ?? rand(DOOR.c0, DOOR.c1),
+    y: y ?? DOOR.r0,
+    vx: rand(-0.18, 0.18),
+    vy: -rand(0.25, 0.55),
+    life: rand(8, 16),
+    g: pick(["*","˙","·","✦","'","✧"])
+  });
+}
+function spawnSmoke(){
+  smokes.push({
+    x: rand(29, 33),
+    y: 3,
+    vx: rand(-0.22, 0.22),
+    vy: -rand(0.12, 0.30),
+    life: rand(10, 22),
+    g: pick(SMOKE_GLY)
+  });
+}
+function leftShovelTip(phase){
+  return phase === 1 ? { x: 20, y: 14 } : { x: 11, y: 13 };
+}
+function rightShovelTip(phase){
+  return phase === 1 ? { x: 52, y: 13 } : { x: 43, y: 14 };
+}
+function spawnToken(side, phase){
+  const tip = side==='L' ? leftShovelTip(phase) : rightShovelTip(phase);
+  const targetX = 31, targetY = 11;
+  const steps = 12;
+  tokens.push({
+    x: tip.x, y: tip.y,
+    vx: (targetX - tip.x)/steps + rand(-0.05,0.05),
+    vy: (targetY - tip.y)/steps + rand(-0.05,0.05),
+    life: 28,
+    word: pick(WORDS)
+  });
+}
+function stepParticles(){
+  if (Math.random() < 0.7) spawnSpark();
+  for (const s of sparks){ s.x += s.vx; s.y += s.vy; s.life -= 1; }
+  for (let i=sparks.length-1;i>=0;i--) if (sparks[i].life<=0 || sparks[i].y < 1) sparks.splice(i,1);
+
+  if (Math.random() < 0.75) spawnSmoke();
+  for (const s of smokes){ s.x += s.vx; s.y += s.vy; s.life -= 1; }
+  for (let i=smokes.length-1;i>=0;i--) if (smokes[i].life<=0 || smokes[i].y < 0) smokes.splice(i,1);
+
+  for (const t of tokens){ t.x += t.vx; t.y += t.vy; t.life -= 1; }
+  for (let i=tokens.length-1;i>=0;i--){
+    const t = tokens[i];
+    const inDoor = (t.x >= DOOR.c0-1 && t.x <= DOOR.c1+1 && t.y >= DOOR.r0-1 && t.y <= DOOR.r1+2);
+    if (inDoor || t.life <= 0){
+      if (inDoor){
+        for (let k=0;k<5;k++) spawnSpark(t.x + rand(-1,1), t.y + rand(-1,1));
+        burned += 1;
+      }
+      tokens.splice(i,1);
+    }
+  }
+}
+function renderParticles(arr, cls){
+  const g = makeGrid();
+  for (const p of arr) put(g, Math.round(p.y), Math.round(p.x), p.g, cls);
+  return g;
+}
+function renderTokenGrid(){
+  const g = makeGrid();
+  for (const t of tokens){
+    const r = Math.round(t.y);
+    const c = Math.round(t.x);
+    for (let i=0;i<t.word.length;i++) put(g, r, c+i, t.word[i], 'token');
+  }
+  return g;
+}
+
+/* ---- canvas drawing ---- */
+function drawGrid(g, glow){
+  for (let r=0;r<H;r++){
+    for (let c=0;c<W;c++){
+      const cell = g[r][c];
+      if (cell.ch === ' ') continue;
+      const color = COLORS[cell.cls] || COLORS.default;
+      // glow disabled — keeps GIF palette small (~15 colors)
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = color;
+      ctx.fillText(cell.ch, c * CHAR_W + 2, r * CHAR_H + 14);
+    }
+  }
+  ctx.shadowBlur = 0;
+}
+
+function drawFooter(){
+  // small footer bar with counter
+  const y = H * CHAR_H + 6;
+  ctx.fillStyle = '#0c0805';
+  ctx.fillRect(0, y, cv.width, 24);
+  ctx.fillStyle = '#7c6a52';
+  ctx.font = '12px "SF Mono","Menlo",monospace';
+  ctx.fillText(`▮ temp: ${1400 + Math.round(120 * ((Math.sin(tick*0.31)+1)/2))}° K`, 8, y+6);
+  const right = `tokens burned: ${String(burned).padStart(6,'0')}`;
+  const rw = ctx.measureText(right).width;
+  ctx.fillText(right, cv.width - rw - 8, y+6);
+  ctx.font = FONT;
+}
+
+let phase = 0, tick = 0, burned = 0;
+
+function tickAnimation(){
+  if (tick % 10 === 0){
+    phase = 1 - phase;
+    if (phase === 1) spawnToken('L', 1);
+    else             spawnToken('R', 1);
+  }
+  if (tick % 7 === 0) spawnToken(Math.random()<0.5 ? 'L' : 'R', phase);
+  stepParticles();
+  tick++;
+}
+
+function drawFrame(){
+  // bg
+  ctx.fillStyle = '#0b0805';
+  ctx.fillRect(0,0,cv.width,cv.height);
+  // subtle warm glow under furnace
+  const grd = ctx.createRadialGradient(cv.width/2, cv.height*0.6, 30, cv.width/2, cv.height*0.6, 260);
+  grd.addColorStop(0, 'rgba(255,122,24,0.10)');
+  grd.addColorStop(1, 'rgba(255,122,24,0)');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0,0,cv.width,cv.height);
+
+  ctx.font = FONT;
+  ctx.textBaseline = 'alphabetic';
+
+  drawGrid(buildBG(phase));
+  drawGrid(renderFlame((Math.sin(tick*0.4)+1)/2), true);
+  drawGrid(renderParticles(sparks, 'spark'), true);
+  drawGrid(renderParticles(smokes, 'smoke'));
+  drawGrid(renderTokenGrid());
+  drawFooter();
+}
+
+/* ---- live preview tick (so user sees the animation before recording) ---- */
+let liveTimer = setInterval(()=>{
+  drawFrame();
+  tickAnimation();
+}, 90);
+
+/* ---- recording ---- */
+const statusEl = document.getElementById('status');
+const dlEl     = document.getElementById('dl');
+const previewEl= document.getElementById('preview');
+
+async function record(){
+  clearInterval(liveTimer);
+  // reset state for clean recording
+  phase = 0; tick = 0; burned = 0;
+  sparks.length = 0; smokes.length = 0; tokens.length = 0;
+  // warm-up so flame + smoke fill in
+  for (let i=0;i<20;i++){ drawFrame(); tickAnimation(); }
+
+  statusEl.textContent = 'loading worker…';
+  // Cross-origin workers need a blob URL; fetch worker source and wrap it.
+  const workerUrl = 'https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.worker.js';
+  const workerSrc = await fetch(workerUrl).then(r => r.text());
+  const workerBlobUrl = URL.createObjectURL(new Blob([workerSrc], { type: 'application/javascript' }));
+
+  statusEl.textContent = 'recording frames…';
+  const FRAMES = 22;
+  const DELAY  = 110; // ms per frame in the gif (~9fps)
+
+  const gif = new GIF({
+    workers: 2,
+    quality: 20,
+    width: cv.width,
+    height: cv.height,
+    workerScript: workerBlobUrl,
+    background: '#0b0805',
+    dither: false,
+  });
+
+  for (let i=0;i<FRAMES;i++){
+    drawFrame();
+    // quantize to fixed palette so gif.js produces a tiny color table
+    const img = ctx.getImageData(0, 0, cv.width, cv.height);
+    snapToPalette(img);
+    ctx.putImageData(img, 0, 0);
+    gif.addFrame(ctx, { copy: true, delay: DELAY });
+    tickAnimation();
+  }
+
+  gif.on('progress', p => { statusEl.textContent = `encoding… ${Math.round(p*100)}%`; });
+  gif.on('finished', blob => {
+    const url = URL.createObjectURL(blob);
+    dlEl.href = url;
+    dlEl.style.display = 'inline-block';
+    previewEl.src = url;
+    statusEl.innerHTML = `<span class="ok">done — ${(blob.size/1024).toFixed(0)} KB · ${FRAMES} frames</span>`;
+
+    // expose for harvesting via eval_js
+    const reader = new FileReader();
+    reader.onload = () => {
+      window.__gifDataUrl = reader.result;
+      window.__gifReady = true;
+      window.__gifSize = blob.size;
+    };
+    reader.readAsDataURL(blob);
+
+    // restart live preview
+    liveTimer = setInterval(()=>{ drawFrame(); tickAnimation(); }, 90);
+  });
+  gif.render();
+}
+
+document.getElementById('rec').addEventListener('click', record);
+
+// auto-record after 600ms
+setTimeout(record, 600);
+</script>
+</body>
+</html>
